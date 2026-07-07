@@ -1,64 +1,34 @@
-# packaging/build.spec
-# PyInstaller spec — يبني exe واحد (onefile) للتطبيق.
-# يُشغَّل بالأمر: pyinstaller packaging/build.spec --noconfirm
-#
-# ⚠️ لازم يضم ui/styles/theme.qss كـ data، وإلا الثيم العام (main.py →
-# _load_theme) هيفشل بصمت جوه الـ exe المبني ويرجع الواجهة للستايل
-# الافتراضي البدائي بتاع Qt.
+name: Build EXE
 
-import sys
-from pathlib import Path
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
 
-block_cipher = None
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-PROJECT_ROOT = Path(SPECPATH).resolve().parent
-THEME_QSS_PATH = PROJECT_ROOT / "ui" / "styles" / "theme.qss"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-if not THEME_QSS_PATH.exists():
-    raise FileNotFoundError(
-        f"\n\n❌ ملف الثيم غير موجود: {THEME_QSS_PATH}\n"
-        "تأكد إنك عملت commit/push لملف ui/styles/theme.qss قبل تشغيل البناء.\n"
-    )
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-a = Analysis(
-    [str(PROJECT_ROOT / "main.py")],
-    pathex=[str(PROJECT_ROOT)],
-    binaries=[],
-    datas=[
-        (str(THEME_QSS_PATH), "ui/styles"),
-    ],
-    hiddenimports=[],
-    hookspath=[],
-    hooksconfig={},
-    runtime_hooks=[],
-    excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
-    noarchive=False,
-)
+      - name: Build exe with PyInstaller
+        run: pyinstaller packaging/build.spec --noconfirm
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
-
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    [],
-    name="AttendanceApp",
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
-    console=False,   # تطبيق واجهة رسومية — بدون نافذة Console سوداء خلفه
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-    icon=None,   # ضع مسار .ico هنا لاحقًا (Phase 9 — أيقونة نهائية)
-)
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AttendanceApp-windows
+          path: dist/AttendanceApp.exe
+          if-no-files-found: error
