@@ -6,6 +6,11 @@
 #
 # ⚠️ لا يوجد هنا أي تصحيح يدوي أو Day Override — دي هتُضاف في Phase 5
 # (EmployeeDetailView + corrections_engine) حسب phases.md.
+#
+# [تعديل] إضافة تبويب ثالث "📅 أيام الحضور" (كان ناقصًا مقارنة بـ oldapp.py
+# الذي كان يعرض 3 تبويبات: توزيع الرواتب / ساعات العمل / أيام الحضور).
+# [تعديل] تكبير الحد الأدنى لارتفاع كارت الموظف في شبكة أسعار الساعة
+# (كان ضيقًا جدًا وبالكاد يظهر النص بوضوح).
 
 import pandas as pd
 
@@ -93,6 +98,7 @@ class DashboardView(QWidget):
     employee_selected = Signal(str)     # (external_code) → Phase 5 (EmployeeDetailView)
 
     RATE_GRID_COLS = 3
+    RATE_CARD_MIN_HEIGHT = 96   # ارتفاع أدنى لكارت الموظف الواحد (كان ضيقًا جدًا سابقًا)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -125,9 +131,10 @@ class DashboardView(QWidget):
 
         self.rates_scroll = QScrollArea()
         self.rates_scroll.setWidgetResizable(True)
-        self.rates_scroll.setMaximumHeight(260)
+        self.rates_scroll.setMaximumHeight(320)
         self.rates_grid_widget = QWidget()
         self.rates_grid = QGridLayout(self.rates_grid_widget)
+        self.rates_grid.setSpacing(10)
         self.rates_scroll.setWidget(self.rates_grid_widget)
         rates_layout.addWidget(self.rates_scroll)
 
@@ -178,12 +185,14 @@ class DashboardView(QWidget):
         self.table_view.setAlternatingRowColors(True)
         outer.addWidget(self.table_view, 1)
 
-        # ── الرسوم البيانية ──
+        # ── الرسوم البيانية (3 تبويبات — مطابق لـ oldapp.py) ──
         self.charts_tabs = QTabWidget()
         self.chart_salary_view = QChartView()
         self.chart_hours_view = QChartView()
+        self.chart_attendance_view = QChartView()
         self.charts_tabs.addTab(self.chart_salary_view, "💰 توزيع الرواتب")
         self.charts_tabs.addTab(self.chart_hours_view, "⏱️ ساعات العمل")
+        self.charts_tabs.addTab(self.chart_attendance_view, "📅 أيام الحضور")
         self.charts_tabs.setMaximumHeight(280)
         outer.addWidget(self.charts_tabs)
 
@@ -227,25 +236,36 @@ class DashboardView(QWidget):
             row_i, col_i = divmod(i, self.RATE_GRID_COLS)
 
             cell = QFrame()
+            cell.setMinimumHeight(self.RATE_CARD_MIN_HEIGHT)
+            cell.setStyleSheet(
+                "QFrame { background:#faf9f5; border:1px solid #e6dfd8; border-radius:10px; }"
+            )
             cell_layout = QVBoxLayout(cell)
+            cell_layout.setContentsMargins(12, 10, 12, 10)
+            cell_layout.setSpacing(6)
+
             inc_days = emp.get('incomplete_days', 0)
             warn = f"  |  ⚠️ {int(inc_days)} ناقصة" if inc_days > 0 else ""
             info_label = QLabel(
                 f"<b>{emp['name']}</b> (ID: {eid})<br>"
                 f"🕐 {emp.get('work_hours', 0):.2f}  |  📅 {emp.get('attendance_days', 0)} يوم{warn}"
             )
+            info_label.setWordWrap(True)
+            info_label.setStyleSheet("font-size:13px; line-height:1.4;")
             cell_layout.addWidget(info_label)
 
             row_h = QHBoxLayout()
             rate_spin = QDoubleSpinBox()
             rate_spin.setRange(0, 100000)
             rate_spin.setDecimals(2)
+            rate_spin.setMinimumHeight(30)
             rate_spin.setValue(self._hourly_rates.get(eid, 0.0))
             rate_spin.valueChanged.connect(lambda val, e=eid: self._on_rate_changed(e, val))
             row_h.addWidget(rate_spin)
 
             view_btn = QPushButton("🔍")
-            view_btn.setFixedWidth(32)
+            view_btn.setFixedWidth(36)
+            view_btn.setMinimumHeight(30)
             view_btn.setToolTip("فتح تفاصيل الموظف (Phase 5)")
             view_btn.clicked.connect(lambda _checked=False, e=eid: self.employee_selected.emit(e))
             row_h.addWidget(view_btn)
@@ -265,7 +285,7 @@ class DashboardView(QWidget):
         payroll_df = calculate_payroll(self._df, self._hourly_rates, self._overrides_summary)
         self.payroll_model.set_dataframe(payroll_df)
         self._update_kpis(payroll_df)
-        self._update_charts(payroll_df)
+        self._update_charts()
 
     # ══════════════════════════════════════════════════════════════════
     def _update_kpis(self, payroll_df: pd.DataFrame):
@@ -281,10 +301,38 @@ class DashboardView(QWidget):
         self.kpi_incomplete.set_value(str(int((payroll_df['أيام بصمة ناقصة'] > 0).sum())))
 
     # ══════════════════════════════════════════════════════════════════
-    def _update_charts(self, payroll_df: pd.DataFrame):
-        top_df = payroll_df.sort_values('صافي الراتب', ascending=False).head(15)
-        self.chart_salary_view.setChart(self._make_bar_chart(top_df, 'صافي الراتب', "توزيع الرواتب (أعلى 15)"))
-        self.chart_hours_view.setChart(self._make_bar_chart(top_df, 'ساعات العمل الفعلية', "ساعات العمل (أعلى 15)"))
+    def _update_charts(self):
+        """
+        [تعديل] الرسوم البيانية الآن تُبنى من self._current_filtered_df() —
+        أي من البيانات **المفلترة فعليًا** (نتيجة البحث + الحد الأدنى/الأقصى)
+        بدل الجدول الكامل — مطابقةً لسلوك oldapp.py الأصلي ولمعيار القبول في
+        phases.md: "الرسوم البيانية تعكس بيانات الجدول المفلتر بدقة."
+        """
+        filtered_df = self._current_filtered_df()
+        top_df = filtered_df.sort_values('صافي الراتب', ascending=False).head(15)
+
+        self.chart_salary_view.setChart(
+            self._make_bar_chart(top_df, 'صافي الراتب', "توزيع الرواتب (أعلى 15)")
+        )
+        self.chart_hours_view.setChart(
+            self._make_bar_chart(top_df, 'ساعات العمل الفعلية', "ساعات العمل (أعلى 15)")
+        )
+        self.chart_attendance_view.setChart(
+            self._make_attendance_chart(filtered_df.head(15))
+        )
+
+    def _current_filtered_df(self) -> pd.DataFrame:
+        """يرجّع نفس صفوف الجدول المفلتر حاليًا (بعد البحث + حدود الراتب) كـ DataFrame."""
+        full_df = self.payroll_model.dataframe()
+        if full_df.empty:
+            return full_df
+        rows = []
+        for r in range(self.proxy_model.rowCount()):
+            src_index = self.proxy_model.mapToSource(self.proxy_model.index(r, 0))
+            rows.append(full_df.iloc[src_index.row()])
+        if not rows:
+            return full_df.iloc[0:0]
+        return pd.DataFrame(rows).reset_index(drop=True)
 
     def _make_bar_chart(self, df: pd.DataFrame, value_col: str, title: str) -> QChart:
         chart = QChart()
@@ -312,9 +360,45 @@ class DashboardView(QWidget):
         chart.legend().setVisible(False)
         return chart
 
+    def _make_attendance_chart(self, df: pd.DataFrame) -> QChart:
+        """
+        رسم "أيام الحضور" — عمودان لكل موظف (أيام الحضور + أيام الغياب)،
+        مطابق لتبويب tab3 في oldapp.py:
+            filtered[['الاسم', 'أيام الحضور', 'أيام الغياب']].set_index('الاسم')
+        """
+        chart = QChart()
+        chart.setTitle("أيام الحضور والغياب")
+        if df.empty:
+            return chart
+
+        att_set = QBarSet("أيام الحضور")
+        absent_set = QBarSet("أيام الغياب")
+        att_set.append([float(v) for v in df['أيام الحضور'].tolist()])
+        absent_set.append([float(v) for v in df['أيام الغياب'].tolist()])
+
+        series = QBarSeries()
+        series.append(att_set)
+        series.append(absent_set)
+        chart.addSeries(series)
+
+        axis_x = QBarCategoryAxis()
+        axis_x.append(df['الاسم'].tolist())
+        chart.addAxis(axis_x, Qt.AlignBottom)
+        series.attachAxis(axis_x)
+
+        axis_y = QValueAxis()
+        max_val = float(max(df['أيام الحضور'].max(), df['أيام الغياب'].max())) if not df.empty else 1.0
+        axis_y.setRange(0, max_val * 1.15 if max_val > 0 else 1.0)
+        chart.addAxis(axis_y, Qt.AlignLeft)
+        series.attachAxis(axis_y)
+
+        chart.legend().setVisible(True)
+        return chart
+
     # ══════════════════════════════════════════════════════════════════
     def _on_filter_changed(self):
         self.proxy_model.set_search_text(self.search_input.text())
         self.proxy_model.set_salary_range(
             self.min_salary_input.value(), self.max_salary_input.value()
         )
+        self._update_charts()

@@ -5,9 +5,14 @@
 # ============================================================
 # ⚠️ ممنوع تعديل أي منطق هنا إلا بعد اجتياز اختبارات Regression
 # (راجع phases.md — Phase 2: "لا تنتقل لمرحلة تالية قبل اجتياز هذه الاختبارات 100%")
+#
+# [تصحيح] build_summary_rows بترجع list[dict] — لازم تتحول لـ pd.DataFrame
+# هنا عشان باقي الكود (main_window.py, dashboard_view.py, payroll_calculator.py)
+# مبني على افتراض إنها DataFrame (زي oldapp.py الأصلي بالظبط).
 
 import re
 import xlrd
+import pandas as pd
 
 from services.parsers.common import (
     remove_close_punches,
@@ -37,7 +42,7 @@ def parse_file_hikvision(file_bytes, cutoff_hour: float = 3.0, saturate_min: int
       - كلا البصمتين موجودتان → زوج مكتمل
 
     Returns:
-        (summary_rows: list[dict], emp_days: dict)
+        (summary_df: pd.DataFrame, emp_days: dict)
     """
     wb = xlrd.open_workbook(file_contents=file_bytes)
     sh = wb.sheet_by_name('AttendanceRecord')
@@ -185,4 +190,5 @@ def parse_file_hikvision(file_bytes, cutoff_hour: float = 3.0, saturate_min: int
     # تعيين أنماط الدوام
     assign_shift_patterns(emp_days)
 
-    return build_summary_rows(emp_days, log_names, log_depts), emp_days
+    summary_rows = build_summary_rows(emp_days, log_names, log_depts)
+    return pd.DataFrame(summary_rows), emp_days
