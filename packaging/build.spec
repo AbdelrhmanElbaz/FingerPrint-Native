@@ -1,37 +1,57 @@
 # packaging/build.spec
-# Phase 0: تغليف أولي — بدون أيقونة حقيقية (Placeholder) وبدون أي أصول إضافية بعد.
-# التشغيل: pyinstaller packaging/build.spec  (من داخل مجلد attendance_app)
+# PyInstaller spec — يبني exe واحد (onefile) للتطبيق.
+# يُشغَّل بالأمر: pyinstaller packaging/build.spec --noconfirm
+#
+# ⚠️ لازم يضم ui/styles/theme.qss كـ data، وإلا الثيم العام (main.py →
+# _load_theme) هيفشل بصمت جوه الـ exe المبني ويرجع الواجهة للستايل
+# الافتراضي البدائي بتاع Qt.
 
-# -*- mode: python ; coding: utf-8 -*-
+import sys
+from pathlib import Path
+
+block_cipher = None
+
+PROJECT_ROOT = Path(SPECPATH).resolve().parent
 
 a = Analysis(
-    ['../main.py'],
-    pathex=['..'],
+    [str(PROJECT_ROOT / "main.py")],
+    pathex=[str(PROJECT_ROOT)],
     binaries=[],
-    datas=[],
+    datas=[
+        (str(PROJECT_ROOT / "ui" / "styles" / "theme.qss"), "ui/styles"),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
     noarchive=False,
 )
-pyz = PYZ(a.pure)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
+    a.zipfiles,
     a.datas,
     [],
-    name='AttendanceApp',
+    name="AttendanceApp",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,       # بدون نافذة Console سوداء خلف التطبيق
-    icon=None,           # Placeholder — سيُستبدل بأيقونة حقيقية لاحقًا (Phase 9)
-    onefile=True,
+    console=False,   # تطبيق واجهة رسومية — بدون نافذة Console سوداء خلفه
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon=None,   # ضع مسار .ico هنا لاحقًا (Phase 9 — أيقونة نهائية)
 )

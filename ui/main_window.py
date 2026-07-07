@@ -28,7 +28,8 @@ from db.repositories.correction_state_repository import CorrectionStateRepositor
 from services.parsers.hikvision_parser import parse_file_hikvision
 from services.parsers.zk_classic_parser import parse_file
 from services.payroll_calculator import apply_early_tolerance, summarize_emp_days
-from services.corrections_engine import apply_overrides
+from services.corrections_engine import apply_overrides, bulk_smart_apply_all
+from ui.widgets.bulk_smart_apply_dialog import BulkSmartApplyDialog
 
 from app_config import APP_NAME, APP_VERSION
 
@@ -124,6 +125,9 @@ class MainWindow(QMainWindow):
         self.dashboard_page = DashboardView()
         self.dashboard_page.rate_changed.connect(self._on_rate_changed)
         self.dashboard_page.employee_selected.connect(self._on_employee_selected)
+        self.dashboard_page.import_new_requested.connect(self.open_import_dialog)
+        self.dashboard_page.reset_to_original_requested.connect(self._on_reset_all_clicked)
+        self.dashboard_page.bulk_smart_apply_requested.connect(self._on_bulk_smart_apply_all_clicked)
         self.stack.addWidget(self.dashboard_page)
 
         # ── شاشة تفاصيل الموظف ──
@@ -254,6 +258,116 @@ class MainWindow(QMainWindow):
                 settings=self._current_settings,
                 header_text=self._current_header_text,
             )
+
+    # ══════════════════════════════════════════════════════════════════
+    # 🔄 العودة للأصل — استعادة الملف كاملًا (كل الموظفين) لحالته الأصلية
+    # نظير الزر المكافئ في oldapp.py (سطر 4443/4457) — بخلاف "🔄 استعادة
+    # الافتراضي" في EmployeeDetailView اللي بيمسح موظف واحد بس.
+    # ══════════════════════════════════════════════════════════════════
+    def _on_reset_all_clicked(self):
+        if self._current_file_id is None:
+            QMessageBox.information(
+                self, "غير متاح",
+                "زر 'العودة للأصل' متاح فقط للملفات المحفوظة (غير المؤقتة/Anonymous)."
+            )
+            return
+
+        confirm = QMessageBox.warning(
+            self, "⚠️ تأكيد العودة للأصل",
+            "سيتم حذف جميع التعديلات والتصحيحات لكل الموظفين في هذا الملف "
+            f"({self._current_header_text}) والعودة للملف الأصلي كما تم استيراده أول مرة.\n\n"
+            "هذا الإجراء لا يمكن التراجع عنه.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        att_file = self.attendance_repo.get_by_id(self._current_file_id)
+        if not att_file or not att_file.original_file_path:
+            QMessageBox.critical(self, "خطأ", "تعذّر العثور على النسخة الأصلية لهذا الملف.")
+            return
+
+        original_path = Path(att_file.original_file_path)
+        if not original_path.exists():
+            QMessageBox.critical(
+                self, "خطأ",
+                f"ملف النسخة الأصلية غير موجود على القرص:\n{original_path}"
+            )
+            return
+
+        original_bytes = original_path.read_bytes()
+
+        # إعادة كتابة ملف العمل بنفس محتوى الأصل — نظير
+        # save_work_file(_orig, _co, _yr, _mo) في oldapp.py.
+        working_path = Path(att_file.working_file_path)
+        working_path.write_bytes(original_bytes)
+
+        # مسح كل التصحيحات والـ day_overrides الخاصة بهذا الملف — لكل الموظفين
+        # دفعة واحدة (مش موظف واحد بس زي _on_employee_reset).
+        self._current_corrections = {}
+        self._current_day_overrides = {}
+        self.correction_state_repo.save(self._current_file_id, {}, {})
+
+        # ── ملاحظة تصميم مقصودة (تختلف عن oldapp.py) ──
+        # في oldapp.py كانت أسعار الساعة (saved_rates) مخزّنة *لكل ملف شهر*
+        # فتُمسح مع "العودة للأصل". في النسخة الـ Native الحالية الأسعار
+        # مخزّنة على مستوى الشركة كلها (employee_rate_defaults — schema.md)
+        # عشان تفضل ثابتة من شهر للتاني. لذلك هذا الزر عمدًا **لا يمسح**
+        # أسعار الساعة — مسحها كان هيأثر على كل شهور الشركة مش بس هذا الملف.
+        # لو الاتفاق مع العميل يتطلب مسح الأسعار كمان، ده قرار منتج محتاج
+        # تأكيد صريح لأنه تغيير سلوك عن الأصل.
+
+        self._current_file_bytes = original_bytes
+        self._run_analysis(
+            file_bytes=self._current_file_bytes,
+            file_format=self._current_file_format,
+            company_id=self._current_company_id,
+            settings=self._current_settings,
+            header_text=self._current_header_text,
+        )
+        QMessageBox.information(self, "تم", "✅ تم استعادة الملف الأصلي بنجاح لكل الموظفين.")
+
+    # ══════════════════════════════════════════════════════════════════
+    # 🤖 Bulk Smart Apply لكل الموظفين (الشاشة الرئيسية)
+    # نظير bulk_smart_apply_all + apply_all_pending في oldapp.py (سطر 4671
+    # و4757) — بخلاف "🤖 Bulk Smart Apply" الموجود جوه EmployeeDetailView
+    # اللي بيشتغل لموظف واحد بس. هنا بيشتغل على self._current_emp_days
+    # كامل (كل الموظفين) ويطبّق مباشرة (مش عبر PendingChangesStore محلي).
+    # ══════════════════════════════════════════════════════════════════
+    def _on_bulk_smart_apply_all_clicked(self, min_sample: int):
+        if self._current_emp_days is None:
+            return
+
+        result = bulk_smart_apply_all(
+            self._current_emp_days,
+            self._current_corrections,
+            {},   # مفيش pending محلي على مستوى الشاشة الرئيسية — كل حاجة تُطبَّق مباشرة
+            self._current_day_overrides,
+            min_sample=min_sample,
+        )
+
+        dialog = BulkSmartApplyDialog(result['applied'], result['skipped'], parent=self)
+        if not (dialog.exec() and result['applied']):
+            return
+
+        # دمج التصحيحات المقترحة مباشرة في corrections الحالية لكل الموظفين
+        for payload in result['pending_changes'].values():
+            key_base = payload['key_base']
+            rev_key = payload['rev_key']
+            self._current_corrections.setdefault(key_base, {})
+            self._current_corrections[key_base][rev_key] = payload['value']
+            self._current_corrections[key_base][f"{rev_key}_role"] = payload['punch_role']
+
+        if self._current_file_id is not None:
+            self.correction_state_repo.save(
+                self._current_file_id, self._current_corrections, self._current_day_overrides
+            )
+
+        self._recompute_dashboard()
+        QMessageBox.information(
+            self, "تم",
+            f"✅ تم تطبيق {len(result['applied'])} تصحيح ذكي بنجاح لكل الموظفين."
+        )
 
     # ══════════════════════════════════════════════════════════════════
     # فتح شهر من الشجرة

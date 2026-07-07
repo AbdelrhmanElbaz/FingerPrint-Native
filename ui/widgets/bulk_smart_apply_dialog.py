@@ -27,6 +27,9 @@ class BulkSmartApplyDialog(QDialog):
         if not applied:
             layout.addWidget(QLabel("لا توجد بصمات تستوفي شروط التطبيق الآمن."))
             close_btn = QPushButton("إغلاق")
+            close_btn.setStyleSheet(
+                "background-color:#efe9de; color:#141413; border:1px solid #e6dfd8;"
+            )
             close_btn.clicked.connect(self.reject)
             layout.addWidget(close_btn)
             return
@@ -53,6 +56,9 @@ class BulkSmartApplyDialog(QDialog):
         confirm_btn = QPushButton(f"✅ تأكيد وتطبيق {len(applied)} تصحيح")
         confirm_btn.clicked.connect(self.accept)
         cancel_btn = QPushButton("❌ إلغاء")
+        cancel_btn.setStyleSheet(
+            "background-color:#efe9de; color:#141413; border:1px solid #e6dfd8;"
+        )
         cancel_btn.clicked.connect(self.reject)
         btn_row.addWidget(confirm_btn)
         btn_row.addWidget(cancel_btn)

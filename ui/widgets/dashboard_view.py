@@ -14,7 +14,7 @@ import pandas as pd
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QFrame,
-    QLineEdit, QDoubleSpinBox, QPushButton, QTableView, QHeaderView,
+    QLineEdit, QDoubleSpinBox, QSpinBox, QPushButton, QTableView, QHeaderView,
     QCheckBox, QTabWidget, QScrollArea
 )
 from PySide6.QtCore import Qt, Signal, QSortFilterProxyModel
@@ -89,6 +89,9 @@ class RateFilterProxy(QSortFilterProxyModel):
 class DashboardView(QWidget):
     rate_changed = Signal(str, float)
     employee_selected = Signal(str)
+    import_new_requested = Signal()          # زر "📤 استيراد ملف جديد" — نظير القديم في الشاشة الرئيسية
+    reset_to_original_requested = Signal()   # زر "🔄 العودة للأصل" — نظير القديم في oldapp.py (سطر 4443)
+    bulk_smart_apply_requested = Signal(int)  # زر "🤖 تطبيق الاقتراح الذكي لكل الموظفين" (min_sample)
 
     RATE_GRID_COLS = 3
     RATE_CARD_MIN_HEIGHT = 96
@@ -105,10 +108,28 @@ class DashboardView(QWidget):
     def _build_ui(self):
         outer = QVBoxLayout(self)
 
+        # ── صف الهيدر: العنوان + استيراد ملف جديد + العودة للأصل ──
+        # نظير الصف العلوي في oldapp.py (_top1, _top2, _top3 — سطر 4437) اللي
+        # كان فيه: عنوان الشهر المفتوح، زر استيراد ملف جديد، وزر "🔄 العودة للأصل".
+        header_row = QHBoxLayout()
+
         self.header_label = QLabel("")
         self.header_label.setAlignment(Qt.AlignCenter)
         self.header_label.setStyleSheet("font-size:16px; font-weight:700; padding:6px 0;")
-        outer.addWidget(self.header_label)
+        header_row.addWidget(self.header_label, 1)
+
+        import_new_btn = QPushButton("📤 استيراد ملف جديد")
+        import_new_btn.clicked.connect(self.import_new_requested.emit)
+        header_row.addWidget(import_new_btn)
+
+        reset_all_btn = QPushButton("🔄 العودة للأصل")
+        reset_all_btn.setStyleSheet(
+            "background-color:#efe9de; color:#141413; border:1px solid #e6dfd8;"
+        )
+        reset_all_btn.clicked.connect(self.reset_to_original_requested.emit)
+        header_row.addWidget(reset_all_btn)
+
+        outer.addLayout(header_row)
 
         rates_box = QFrame()
         rates_layout = QVBoxLayout(rates_box)
@@ -182,6 +203,28 @@ class DashboardView(QWidget):
         self.charts_tabs.addTab(self.chart_attendance_view, "📅 أيام الحضور")
         self.charts_tabs.setMaximumHeight(280)
         outer.addWidget(self.charts_tabs)
+
+        # ── 🤖 Bulk Smart Apply لكل الموظفين ──
+        # نظير bulk_col1/bulk_col2/bulk_col3 في oldapp.py (سطر 4661) —
+        # كان هذا الجزء غائبًا عن الشاشة الرئيسية في النسخة الـ Native
+        # (موجود بس كـ Widget مربوط بموظف واحد داخل EmployeeDetailView).
+        bulk_box = QFrame()
+        bulk_box.setStyleSheet("QFrame { border-top: 1px solid #e6dfd8; margin-top: 8px; }")
+        bulk_layout = QHBoxLayout(bulk_box)
+
+        self.bulk_min_sample_input = QSpinBox()
+        self.bulk_min_sample_input.setRange(1, 10)
+        self.bulk_min_sample_input.setValue(3)
+        self.bulk_min_sample_input.setPrefix("الحد الأدنى لعدد الأيام المشابهة: ")
+        bulk_layout.addWidget(self.bulk_min_sample_input, 1)
+
+        bulk_apply_btn = QPushButton("🤖 تطبيق الاقتراح الذكي لكل الموظفين")
+        bulk_apply_btn.clicked.connect(
+            lambda: self.bulk_smart_apply_requested.emit(self.bulk_min_sample_input.value())
+        )
+        bulk_layout.addWidget(bulk_apply_btn, 2)
+
+        outer.addWidget(bulk_box)
 
     def load_data(self, header_text: str, df, overrides_summary: dict, hourly_rates: dict):
         self.header_label.setText(header_text)
