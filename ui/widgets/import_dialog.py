@@ -25,6 +25,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 
+from services.paths import get_month_dir
+
 ARABIC_MONTHS = [
     '', 'يناير', 'فبراير', 'مارس', 'أبريل', 'مايو', 'يونيو',
     'يوليو', 'أغسطس', 'سبتمبر', 'أكتوبر', 'نوفمبر', 'ديسمبر'
@@ -250,8 +252,7 @@ class ImportDialog(QDialog):
             company = self.company_repo.create(company_name)
 
             # 2) تجهيز مسار التخزين: data/<company>/<year>/<month>/
-            data_root = Path(__file__).resolve().parent.parent.parent / "data"
-            month_dir = data_root / company.name / str(year) / f"{month:02d}"
+            month_dir = get_month_dir(company.name, year, month)
             month_dir.mkdir(parents=True, exist_ok=True)
 
             base_name = f"{company.name}_{year}_{month:02d}"

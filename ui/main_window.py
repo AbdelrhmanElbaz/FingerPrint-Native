@@ -1,12 +1,10 @@
 # ui/main_window.py
-# النافذة الرئيسية — Phase 3: ربط شجرة الملفات (Sidebar) + نافذة الاستيراد.
+# Phase 4: ربط شجرة الملفات + الاستيراد بمحرك التحليل الفعلي (Parsers من
+# Phase 2) وعرض النتائج في DashboardView حقيقية (KPI + جدول رواتب + رسوم).
 #
-# ⚠️ ملاحظات مهمة قبل التشغيل:
-# 1. هذا الملف يفترض أنك عندك بالفعل CompanyRepository و AttendanceFileRepository
-#    داخل db/repositories/ (من Phase 1). عدّل الـ import أدناه لو أسماء الملفات
-#    أو الكلاسات مختلفة عندك.
-# 2. الشاشات الحقيقية (Dashboard, Employee Detail) لسه هتتضاف في Phase 4/5 —
-#    حالياً فيه Placeholder بسيط بدالها.
+# ⚠️ لا يوجد هنا أي تصحيح يدوي أو Day Override — هتُضاف في Phase 5.
+
+from pathlib import Path
 
 from PySide6.QtWidgets import (
     QMainWindow, QDockWidget, QStackedWidget, QWidget, QVBoxLayout,
@@ -16,12 +14,34 @@ from PySide6.QtCore import Qt
 
 from ui.widgets.file_tree_sidebar import FileTreeSidebar
 from ui.widgets.import_dialog import ImportDialog
+from ui.widgets.dashboard_view import DashboardView
 
 from db.database import init_db, get_session
 from db.repositories.company_repository import CompanyRepository
 from db.repositories.attendance_repository import AttendanceFileRepository
+from db.repositories.employee_repository import EmployeeRepository
+from db.repositories.file_settings_repository import FileSettingsRepository
+from db.repositories.employee_rate_repository import EmployeeRateRepository
+
+from services.parsers.hikvision_parser import parse_file_hikvision
+from services.parsers.zk_classic_parser import parse_file
+from services.payroll_calculator import apply_early_tolerance, summarize_emp_days
 
 from app_config import APP_NAME, APP_VERSION
+
+ARABIC_MONTHS = [
+    '', 'يناير', 'فبراير', 'مارس', 'أبريل', 'مايو', 'يونيو',
+    'يوليو', 'أغسطس', 'سبتمبر', 'أكتوبر', 'نوفمبر', 'ديسمبر'
+]
+
+
+class _DefaultFileSettings:
+    """إعدادات افتراضية للوضع Anonymous — لا يوجد له سجل FileSettings في القاعدة."""
+    cutoff_hour = 3.0
+    saturate_minutes = None
+    tolerance_enabled = False
+    tolerance_minutes = 0
+    duplicate_punch_tolerance = 10
 
 
 class MainWindow(QMainWindow):
@@ -31,16 +51,21 @@ class MainWindow(QMainWindow):
         self.setLayoutDirection(Qt.RightToLeft)
         self.resize(1280, 800)
 
-        # ── إعداد الـ Repositories (نمرر جلسة قاعدة البيانات) ──
-        init_db()  # يضمن وجود الجداول لو أول مرة تفتح فيها هذه النافذة بمعزل عن main.py
+        init_db()
         self.session = get_session()
         self.company_repo = CompanyRepository(self.session)
         self.attendance_repo = AttendanceFileRepository(self.session)
+        self.employee_repo = EmployeeRepository(self.session)
+        self.file_settings_repo = FileSettingsRepository(self.session)
+        self.rate_repo = EmployeeRateRepository(self.session)
 
         self._current_company_id = None
         self._current_company_name = None
         self._current_year = None
         self._current_month = None
+        self._current_file_id = None
+        self._current_emp_days = None
+        self._eid_to_employee_id = {}   # external_code -> Employee.id (فارغ في وضع Anonymous)
 
         self._build_central_stack()
         self._build_sidebar()
@@ -55,7 +80,6 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
 
-        # ── شاشة placeholder لحد ما نضيف Dashboard الحقيقي في Phase 4 ──
         self.placeholder_page = QWidget()
         ph_layout = QVBoxLayout(self.placeholder_page)
         self.placeholder_label = QLabel("👆 ابدأ باستيراد ملف حضور من الشريط الجانبي")
@@ -68,13 +92,10 @@ class MainWindow(QMainWindow):
 
         self.stack.addWidget(self.placeholder_page)
 
-        # ── مكان الشاشة الرئيسية الحقيقية (Dashboard) — تُضاف لاحقًا Phase 4 ──
-        self.dashboard_page = QWidget()
-        dash_layout = QVBoxLayout(self.dashboard_page)
-        self.dashboard_title = QLabel("")
-        self.dashboard_title.setAlignment(Qt.AlignCenter)
-        dash_layout.addWidget(self.dashboard_title)
-        dash_layout.addWidget(QLabel("📊 لوحة التحكم والرواتب ستُضاف هنا في Phase 4"))
+        # ── الشاشة الرئيسية الحقيقية (Dashboard) — Phase 4 ──
+        self.dashboard_page = DashboardView()
+        self.dashboard_page.rate_changed.connect(self._on_rate_changed)
+        self.dashboard_page.employee_selected.connect(self._on_employee_selected)
         self.stack.addWidget(self.dashboard_page)
 
     def _show_import_placeholder(self):
@@ -97,7 +118,7 @@ class MainWindow(QMainWindow):
         self.sidebar_dock = dock
 
     # ══════════════════════════════════════════════════════════════════
-    # شريط الحالة (StatusBar) — بديل الـ Floating Apply Bar
+    # شريط الحالة (StatusBar)
     # ══════════════════════════════════════════════════════════════════
     def _build_status_bar(self):
         self.status_bar = QStatusBar()
@@ -106,14 +127,14 @@ class MainWindow(QMainWindow):
         self.status_bar.addPermanentWidget(self.pending_label)
 
     def update_pending_status(self, count: int):
-        """يُستدعى من شاشات لاحقة (Phase 5) لتحديث عدد التعديلات المعلَّقة."""
+        """يُستدعى من Phase 5 لتحديث عدد التعديلات المعلَّقة."""
         if count > 0:
             self.pending_label.setText(f"⏳ {count} تعديل معلَّق بانتظار Apply")
         else:
             self.pending_label.setText("")
 
     # ══════════════════════════════════════════════════════════════════
-    # فتح نافذة الاستيراد
+    # الاستيراد
     # ══════════════════════════════════════════════════════════════════
     def open_import_dialog(self):
         dialog = ImportDialog(self.company_repo, self.attendance_repo, parent=self)
@@ -121,66 +142,172 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _on_import_completed(self, payload: dict):
-        """
-        يُستدعى بعد نجاح الاستيراد (Anonymous أو دائم).
-        هنا المفروض تحليل الملف الفعلي (parsers) وتخزين النتائج —
-        سيُنفَّذ بالتفصيل عند دمج Phase 4 (Dashboard) لأنه يحتاج
-        استدعاء parse_file / parse_file_hikvision وربطها بالعرض.
-        """
         if payload["is_anonymous"]:
             self._current_company_id = None
             self._current_company_name = None
             self._current_year = None
             self._current_month = None
-            self.setWindowTitle("نظام الحضور والرواتب — مراجعة مؤقتة (Anonymous)")
+            self._current_file_id = None
+            self.setWindowTitle(f"{APP_NAME} — مراجعة مؤقتة (Anonymous)")
+
+            self._run_analysis(
+                file_bytes=payload["file_bytes"],
+                file_format=payload["file_format"],
+                company_id=None,
+                settings=_DefaultFileSettings(),
+                header_text="📤 مراجعة مؤقتة (Anonymous)",
+            )
         else:
             self._current_company_id = payload["company_id"]
             self._current_company_name = payload["company_name"]
             self._current_year = payload["year"]
             self._current_month = payload["month"]
+            self._current_file_id = payload["attendance_file_id"]
+
             self.sidebar.set_current_open(
                 payload["company_id"], payload["year"], payload["month"]
             )
             self.setWindowTitle(
-                f"نظام الحضور والرواتب — {payload['company_name']} "
+                f"{APP_NAME} — {payload['company_name']} "
                 f"({payload['month']:02d}/{payload['year']})"
             )
 
-        # TODO (Phase 4): تمرير payload['file_bytes'] و payload['file_format']
-        # لخدمة التحليل المناسبة (parse_file / parse_file_hikvision) وعرض
-        # النتائج في self.dashboard_page، ثم:
-        self.dashboard_title.setText(
-            f"📂 {payload.get('company_name') or 'مراجعة مؤقتة'} "
-            f"— {payload.get('month', '')}/{payload.get('year', '')}"
-        )
-        self.stack.setCurrentWidget(self.dashboard_page)
+            settings = self.file_settings_repo.get_or_create(self._current_file_id)
+            self._run_analysis(
+                file_bytes=payload["file_bytes"],
+                file_format=payload["file_format"],
+                company_id=self._current_company_id,
+                settings=settings,
+                header_text=f"📂 {payload['company_name']} — "
+                            f"{ARABIC_MONTHS[payload['month']]} {payload['year']}",
+            )
 
     # ══════════════════════════════════════════════════════════════════
     # فتح شهر من الشجرة
     # ══════════════════════════════════════════════════════════════════
     def _on_month_opened(self, company_id: int, company_name: str, year: int, month: int):
-        # TODO (Phase 4): تحميل working_file من AttendanceFileRepository،
-        # ثم تشغيل التحليل وعرض النتائج بدل الأسطر التالية فقط.
+        att_file = self.attendance_repo.get_by_company_year_month(company_id, year, month)
+        if not att_file:
+            QMessageBox.critical(self, "خطأ", "تعذّر العثور على الملف في قاعدة البيانات.")
+            return
+
+        work_path = Path(att_file.working_file_path)
+        if not work_path.exists():
+            QMessageBox.critical(
+                self, "خطأ",
+                f"ملف العمل غير موجود على القرص:\n{work_path}\n"
+                "قد يكون تم نقله أو حذفه يدويًا خارج البرنامج."
+            )
+            return
+
+        file_bytes = work_path.read_bytes()
+
         self._current_company_id = company_id
         self._current_company_name = company_name
         self._current_year = year
         self._current_month = month
+        self._current_file_id = att_file.id
 
-        self.setWindowTitle(f"نظام الحضور والرواتب — {company_name} ({month:02d}/{year})")
-        self.dashboard_title.setText(f"📂 {company_name} — {month}/{year}")
+        self.setWindowTitle(f"{APP_NAME} — {company_name} ({month:02d}/{year})")
+
+        settings = self.file_settings_repo.get_or_create(att_file.id)
+        self._run_analysis(
+            file_bytes=file_bytes,
+            file_format=att_file.file_format,
+            company_id=company_id,
+            settings=settings,
+            header_text=f"📂 {company_name} — {ARABIC_MONTHS[month]} {year}",
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    # نقطة الدمج المركزية: تحليل → تسامح → مزامنة موظفين → أسعار → عرض
+    # ══════════════════════════════════════════════════════════════════
+    def _run_analysis(self, file_bytes: bytes, file_format: str, company_id, settings, header_text: str):
+        try:
+            if file_format == "hikvision":
+                df, emp_days = parse_file_hikvision(
+                    file_bytes,
+                    cutoff_hour=settings.cutoff_hour,
+                    saturate_min=settings.saturate_minutes,
+                    duplicate_punch_tolerance=settings.duplicate_punch_tolerance,
+                )
+            else:
+                df, emp_days = parse_file(
+                    file_bytes,
+                    cutoff_hour=settings.cutoff_hour,
+                    saturate_min=settings.saturate_minutes,
+                    duplicate_punch_tolerance=settings.duplicate_punch_tolerance,
+                )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "خطأ في تحليل الملف",
+                f"تعذّر تحليل الملف بصيغة {file_format}:\n{e}\n\n"
+                "تأكد أن الملف يطابق نوع الجهاز المختار عند الاستيراد."
+            )
+            self._show_import_placeholder()
+            return
+
+        emp_days = apply_early_tolerance(
+            emp_days,
+            tolerance_minutes=settings.tolerance_minutes,
+            tolerance_enabled=settings.tolerance_enabled,
+            saturate_min=settings.saturate_minutes,
+        )
+        overrides_summary = summarize_emp_days(emp_days)
+        self._current_emp_days = emp_days
+
+        # ── مزامنة الموظفين مع القاعدة + تحميل أسعار الساعة المحفوظة ──
+        hourly_rates = {}
+        self._eid_to_employee_id = {}
+
+        if company_id is not None:
+            for _, row in df.iterrows():
+                eid = str(row['id'])
+                employee = self.employee_repo.get_or_create(
+                    company_id=company_id,
+                    external_code=eid,
+                    name=row.get('name', ''),
+                    department=row.get('department', ''),
+                )
+                self._eid_to_employee_id[eid] = employee.id
+
+            rates_by_employee_id = self.rate_repo.get_rates_map_by_employee_id(company_id)
+            for eid, emp_id in self._eid_to_employee_id.items():
+                if emp_id in rates_by_employee_id:
+                    hourly_rates[eid] = rates_by_employee_id[emp_id]
+
+        self.dashboard_page.load_data(header_text, df, overrides_summary, hourly_rates)
         self.stack.setCurrentWidget(self.dashboard_page)
+
+    # ══════════════════════════════════════════════════════════════════
+    def _on_rate_changed(self, eid: str, rate: float):
+        """حفظ سعر الساعة كإعداد افتراضي دائم للموظف داخل شركته (لو مش Anonymous)."""
+        if self._current_company_id is None:
+            return  # وضع Anonymous — السعر في الذاكرة فقط، بدون حفظ دائم
+        employee_id = self._eid_to_employee_id.get(eid)
+        if employee_id is None:
+            return
+        self.rate_repo.set_rate(self._current_company_id, employee_id, rate)
+
+    # ══════════════════════════════════════════════════════════════════
+    def _on_employee_selected(self, eid: str):
+        """Phase 5: فتح EmployeeDetailView الكاملة. حاليًا Placeholder بسيط."""
+        QMessageBox.information(
+            self, "قريبًا",
+            f"شاشة تفاصيل الموظف (ID: {eid}) هتُضاف في Phase 5 "
+            "(التصحيحات اليدوية وReview Panel)."
+        )
 
     # ══════════════════════════════════════════════════════════════════
     def _on_company_renamed(self, company_id: int, new_name: str):
         if company_id == self._current_company_id:
             self._current_company_name = new_name
             self.setWindowTitle(
-                f"نظام الحضور والرواتب — {new_name} "
+                f"{APP_NAME} — {new_name} "
                 f"({self._current_month:02d}/{self._current_year})"
             )
 
     def _on_tree_changed(self):
-        # لو الملف المفتوح حاليًا اتحذف، نرجع للـ placeholder
         if self._current_company_id is None and self.stack.currentWidget() is self.dashboard_page:
             self._show_import_placeholder()
 

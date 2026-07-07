@@ -1,6 +1,7 @@
 # db/repositories/attendance_repository.py
 
-from db.models import AttendanceFile, FileSettings
+from db.models import AttendanceFile, FileSettings, Company
+from services.paths import delete_month_folder
 
 
 class AttendanceFileRepository:
@@ -62,10 +63,28 @@ class AttendanceFileRepository:
         return tree
 
     def delete(self, file_id: int) -> None:
+        """
+        يحذف الملف من قاعدة البيانات، ثم يحذف مجلده الفعلي من القرص
+        (data/<company>/<year>/<month>/) — بدون هذه الخطوة الثانية، الملف
+        يختفي من الشجرة في الواجهة لكن يظل موجودًا فعليًا على القرص.
+        """
         att_file = self.get_by_id(file_id)
-        if att_file:
-            self.session.delete(att_file)
-            self.session.commit()
+        if not att_file:
+            return
+
+        company_name = None
+        if att_file.company_id:
+            company = self.session.query(Company).filter_by(id=att_file.company_id).first()
+            if company:
+                company_name = company.name
+        year, month = att_file.year, att_file.month
+
+        self.session.delete(att_file)
+        self.session.commit()
+
+        # ملفات Anonymous (company_id=None) مش متخزنة أصلًا بمسار دائم في data/
+        if company_name:
+            delete_month_folder(company_name, year, month)
 
     def move_to_new_month(self, file_id: int, new_year: int, new_month: int) -> bool:
         """
