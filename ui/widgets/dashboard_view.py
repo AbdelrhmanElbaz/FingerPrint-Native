@@ -4,13 +4,11 @@
 # MainWindow (df, overrides_summary, hourly_rates) وتُطلق Signals عند أي
 # تفاعل (تغيير سعر ساعة، طلب فتح تفاصيل موظف) ليتولّاها MainWindow.
 #
-# ⚠️ لا يوجد هنا أي تصحيح يدوي أو Day Override — دي هتُضاف في Phase 5
-# (EmployeeDetailView + corrections_engine) حسب phases.md.
-#
-# [تعديل] إضافة تبويب ثالث "📅 أيام الحضور" (كان ناقصًا مقارنة بـ oldapp.py
-# الذي كان يعرض 3 تبويبات: توزيع الرواتب / ساعات العمل / أيام الحضور).
-# [تعديل] تكبير الحد الأدنى لارتفاع كارت الموظف في شبكة أسعار الساعة
-# (كان ضيقًا جدًا وبالكاد يظهر النص بوضوح).
+# [إصلاح] load_data كانت بتخزّن الـ df الخام مباشرة كـ self._df، فكارت
+# الموظف في _refresh_rate_grid (ساعات العمل/أيام الحضور/بصمة ناقصة) كان
+# يعرض دائمًا القيم من أول تحليل للملف — حتى بعد أي تصحيح يدوي أو تعديل
+# يوم من EmployeeDetailView. الحل: دمج overrides_summary في نسخة عرض من
+# df (نظير df_display في oldapp.py) قبل تخزينها كـ self._df.
 
 import pandas as pd
 
@@ -51,11 +49,6 @@ class KpiCard(QFrame):
 
 
 class RateFilterProxy(QSortFilterProxyModel):
-    """
-    تصفية بالاسم/الـ ID + حد أدنى/أقصى للراتب — بديل الفلترة اليدوية على
-    pandas في النسخة القديمة (st_col1 search + mn_col/mx_col).
-    """
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self._search_text = ""
@@ -94,11 +87,11 @@ class RateFilterProxy(QSortFilterProxyModel):
 
 
 class DashboardView(QWidget):
-    rate_changed = Signal(str, float)   # (external_code, new_rate) → يتولى MainWindow حفظه
-    employee_selected = Signal(str)     # (external_code) → Phase 5 (EmployeeDetailView)
+    rate_changed = Signal(str, float)
+    employee_selected = Signal(str)
 
     RATE_GRID_COLS = 3
-    RATE_CARD_MIN_HEIGHT = 96   # ارتفاع أدنى لكارت الموظف الواحد (كان ضيقًا جدًا سابقًا)
+    RATE_CARD_MIN_HEIGHT = 96
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -109,7 +102,6 @@ class DashboardView(QWidget):
 
         self._build_ui()
 
-    # ══════════════════════════════════════════════════════════════════
     def _build_ui(self):
         outer = QVBoxLayout(self)
 
@@ -118,7 +110,6 @@ class DashboardView(QWidget):
         self.header_label.setStyleSheet("font-size:16px; font-weight:700; padding:6px 0;")
         outer.addWidget(self.header_label)
 
-        # ── قسم أسعار الساعة ──
         rates_box = QFrame()
         rates_layout = QVBoxLayout(rates_box)
         rates_title = QLabel("💰 سعر الساعة لكل موظف")
@@ -138,9 +129,8 @@ class DashboardView(QWidget):
         self.rates_scroll.setWidget(self.rates_grid_widget)
         rates_layout.addWidget(self.rates_scroll)
 
-        outer.addWidget(rates_box)
+        outer.addWidget(rates_box, 5)
 
-        # ── كروت KPI ──
         kpi_row = QHBoxLayout()
         self.kpi_employees = KpiCard("👥 عدد الموظفين")
         self.kpi_total_salary = KpiCard("💵 إجمالي الرواتب")
@@ -150,7 +140,6 @@ class DashboardView(QWidget):
             kpi_row.addWidget(card)
         outer.addLayout(kpi_row)
 
-        # ── البحث والتصفية ──
         filter_row = QHBoxLayout()
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("🔎 ابحث عن موظف بالاسم أو الـ ID")
@@ -172,7 +161,6 @@ class DashboardView(QWidget):
         filter_row.addWidget(self.max_salary_input, 1)
         outer.addLayout(filter_row)
 
-        # ── جدول كشف الرواتب ──
         self.payroll_model = PayrollTableModel()
         self.proxy_model = RateFilterProxy()
         self.proxy_model.setSourceModel(self.payroll_model)
@@ -185,7 +173,6 @@ class DashboardView(QWidget):
         self.table_view.setAlternatingRowColors(True)
         outer.addWidget(self.table_view, 1)
 
-        # ── الرسوم البيانية (3 تبويبات — مطابق لـ oldapp.py) ──
         self.charts_tabs = QTabWidget()
         self.chart_salary_view = QChartView()
         self.chart_hours_view = QChartView()
@@ -196,27 +183,36 @@ class DashboardView(QWidget):
         self.charts_tabs.setMaximumHeight(280)
         outer.addWidget(self.charts_tabs)
 
-    # ══════════════════════════════════════════════════════════════════
-    def load_data(self, header_text: str, df: pd.DataFrame, overrides_summary: dict, hourly_rates: dict):
-        """
-        يُستدعى من MainWindow بعد تحليل ملف (استيراد جديد أو فتح من الشجرة).
-
-        df: DataFrame الملخّص من الـ parser (أعمدة: id, name, department,
-            work_hours, attendance_days, absent_days, incomplete_days).
-        overrides_summary: ناتج services.payroll_calculator.summarize_emp_days()
-                           (بعد تطبيق التسامح فقط، بدون تصحيحات يدوية).
-        hourly_rates: dict {external_code: rate} — من EmployeeRateRepository،
-                     أو {} في وضع Anonymous.
-        """
+    def load_data(self, header_text: str, df, overrides_summary: dict, hourly_rates: dict):
         self.header_label.setText(header_text)
-        self._df = df if df is not None else pd.DataFrame()
+        raw_df = df if df is not None else pd.DataFrame()
         self._overrides_summary = overrides_summary or {}
         self._hourly_rates = dict(hourly_rates or {})
+
+        # [إصلاح] دمج overrides_summary في نسخة عرض من df — نظير df_display في
+        # oldapp.py. بدون هذا الدمج، كارت الموظف (ساعات العمل/أيام الحضور/بصمة
+        # ناقصة في _refresh_rate_grid) كان يعرض دائمًا القيم الخام من أول تحليل
+        # للملف، حتى بعد تصحيح البصمات أو تعديل يوم بالكامل من EmployeeDetailView
+        # — وهو ما كان يظهر كـ "القيمة القديمة" و"بصمة ناقصة متبقية" في الداشبورد
+        # رغم أن التصحيح تم تطبيقه فعليًا (جدول كشف الرواتب نفسه كان يعرض الرقم
+        # الصحيح لأن calculate_payroll يقرأ overrides_summary مباشرة، بعكس الكارت).
+        df_display = raw_df.copy()
+        if not df_display.empty:
+            for eid, ov in self._overrides_summary.items():
+                mask = df_display['id'].astype(str) == str(eid)
+                if not mask.any():
+                    continue
+                df_display.loc[mask, 'work_hours']      = ov.get('work_hours', 0)
+                df_display.loc[mask, 'work_minutes']    = ov.get('work_minutes', 0)
+                df_display.loc[mask, 'attendance_days'] = ov.get('attendance_days', 0)
+                df_display.loc[mask, 'absent_days']     = ov.get('absent_days', 0)
+                df_display.loc[mask, 'incomplete_days'] = ov.get('incomplete_days', 0)
+
+        self._df = df_display
 
         self._refresh_rate_grid()
         self._recompute_payroll()
 
-    # ══════════════════════════════════════════════════════════════════
     def _refresh_rate_grid(self):
         while self.rates_grid.count():
             item = self.rates_grid.takeAt(0)
@@ -259,14 +255,19 @@ class DashboardView(QWidget):
             rate_spin.setRange(0, 100000)
             rate_spin.setDecimals(2)
             rate_spin.setMinimumHeight(30)
+
+            # ── blockSignals يمنع valueChanged من الانطلاق أثناء setValue ──
+            rate_spin.blockSignals(True)
             rate_spin.setValue(self._hourly_rates.get(eid, 0.0))
+            rate_spin.blockSignals(False)
+
             rate_spin.valueChanged.connect(lambda val, e=eid: self._on_rate_changed(e, val))
             row_h.addWidget(rate_spin)
 
             view_btn = QPushButton("🔍")
             view_btn.setFixedWidth(36)
             view_btn.setMinimumHeight(30)
-            view_btn.setToolTip("فتح تفاصيل الموظف (Phase 5)")
+            view_btn.setToolTip("فتح تفاصيل الموظف")
             view_btn.clicked.connect(lambda _checked=False, e=eid: self.employee_selected.emit(e))
             row_h.addWidget(view_btn)
 
@@ -274,20 +275,17 @@ class DashboardView(QWidget):
             self.rates_grid.addWidget(cell, row_i, col_i)
             self._rate_inputs[eid] = rate_spin
 
-    # ══════════════════════════════════════════════════════════════════
     def _on_rate_changed(self, eid: str, value: float):
         self._hourly_rates[eid] = value
         self.rate_changed.emit(eid, value)
         self._recompute_payroll()
 
-    # ══════════════════════════════════════════════════════════════════
     def _recompute_payroll(self):
         payroll_df = calculate_payroll(self._df, self._hourly_rates, self._overrides_summary)
         self.payroll_model.set_dataframe(payroll_df)
         self._update_kpis(payroll_df)
         self._update_charts()
 
-    # ══════════════════════════════════════════════════════════════════
     def _update_kpis(self, payroll_df: pd.DataFrame):
         if payroll_df.empty:
             self.kpi_employees.set_value("0")
@@ -300,14 +298,7 @@ class DashboardView(QWidget):
         self.kpi_total_hours.set_value(f"{payroll_df['ساعات العمل الفعلية'].sum():,.1f}")
         self.kpi_incomplete.set_value(str(int((payroll_df['أيام بصمة ناقصة'] > 0).sum())))
 
-    # ══════════════════════════════════════════════════════════════════
     def _update_charts(self):
-        """
-        [تعديل] الرسوم البيانية الآن تُبنى من self._current_filtered_df() —
-        أي من البيانات **المفلترة فعليًا** (نتيجة البحث + الحد الأدنى/الأقصى)
-        بدل الجدول الكامل — مطابقةً لسلوك oldapp.py الأصلي ولمعيار القبول في
-        phases.md: "الرسوم البيانية تعكس بيانات الجدول المفلتر بدقة."
-        """
         filtered_df = self._current_filtered_df()
         top_df = filtered_df.sort_values('صافي الراتب', ascending=False).head(15)
 
@@ -322,7 +313,6 @@ class DashboardView(QWidget):
         )
 
     def _current_filtered_df(self) -> pd.DataFrame:
-        """يرجّع نفس صفوف الجدول المفلتر حاليًا (بعد البحث + حدود الراتب) كـ DataFrame."""
         full_df = self.payroll_model.dataframe()
         if full_df.empty:
             return full_df
@@ -361,11 +351,6 @@ class DashboardView(QWidget):
         return chart
 
     def _make_attendance_chart(self, df: pd.DataFrame) -> QChart:
-        """
-        رسم "أيام الحضور" — عمودان لكل موظف (أيام الحضور + أيام الغياب)،
-        مطابق لتبويب tab3 في oldapp.py:
-            filtered[['الاسم', 'أيام الحضور', 'أيام الغياب']].set_index('الاسم')
-        """
         chart = QChart()
         chart.setTitle("أيام الحضور والغياب")
         if df.empty:
@@ -395,7 +380,6 @@ class DashboardView(QWidget):
         chart.legend().setVisible(True)
         return chart
 
-    # ══════════════════════════════════════════════════════════════════
     def _on_filter_changed(self):
         self.proxy_model.set_search_text(self.search_input.text())
         self.proxy_model.set_salary_range(

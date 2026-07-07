@@ -15,6 +15,7 @@ class EmployeeRepository:
         emp = (
             self.session.query(Employee)
             .filter_by(company_id=company_id, external_code=external_code)
+            .order_by(Employee.id.asc())   # حتمية الاختيار لو فيه صفوف مكررة قديمة
             .first()
         )
         if emp:

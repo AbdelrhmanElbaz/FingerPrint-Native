@@ -1,8 +1,7 @@
 # ui/main_window.py
-# Phase 4: ربط شجرة الملفات + الاستيراد بمحرك التحليل الفعلي (Parsers من
-# Phase 2) وعرض النتائج في DashboardView حقيقية (KPI + جدول رواتب + رسوم).
-#
-# ⚠️ لا يوجد هنا أي تصحيح يدوي أو Day Override — هتُضاف في Phase 5.
+# Phase 8: دمج SettingsPanel (Cutoff / Saturate / Tolerance / Duplicate Punch)
+# كـ QDockWidget مستقل، مع إعادة تحليل تلقائية عند أي تغيير إعداد.
+# التغييرات عن نسخة Phase 5 مُعلَّمة بتعليقات "# [Phase 8]".
 
 from pathlib import Path
 
@@ -15,6 +14,8 @@ from PySide6.QtCore import Qt
 from ui.widgets.file_tree_sidebar import FileTreeSidebar
 from ui.widgets.import_dialog import ImportDialog
 from ui.widgets.dashboard_view import DashboardView
+from ui.widgets.employee_detail_view import EmployeeDetailView
+from ui.widgets.settings_panel import SettingsPanel   # [Phase 8]
 
 from db.database import init_db, get_session
 from db.repositories.company_repository import CompanyRepository
@@ -22,10 +23,12 @@ from db.repositories.attendance_repository import AttendanceFileRepository
 from db.repositories.employee_repository import EmployeeRepository
 from db.repositories.file_settings_repository import FileSettingsRepository
 from db.repositories.employee_rate_repository import EmployeeRateRepository
+from db.repositories.correction_state_repository import CorrectionStateRepository
 
 from services.parsers.hikvision_parser import parse_file_hikvision
 from services.parsers.zk_classic_parser import parse_file
 from services.payroll_calculator import apply_early_tolerance, summarize_emp_days
+from services.corrections_engine import apply_overrides
 
 from app_config import APP_NAME, APP_VERSION
 
@@ -36,12 +39,18 @@ ARABIC_MONTHS = [
 
 
 class _DefaultFileSettings:
-    """إعدادات افتراضية للوضع Anonymous — لا يوجد له سجل FileSettings في القاعدة."""
-    cutoff_hour = 3.0
-    saturate_minutes = None
-    tolerance_enabled = False
-    tolerance_minutes = 0
-    duplicate_punch_tolerance = 10
+    """إعدادات افتراضية للوضع Anonymous — لا يوجد له سجل FileSettings في القاعدة.
+
+    [Phase 8] أصبحت instance-level بدل class-level فقط، عشان SettingsPanel
+    يقدر يعدّلها Runtime (عبر _run_analysis المُعاد استدعاؤه) بدون أي تأثير
+    على أي وضع Anonymous آخر مفتوح لاحقًا في نفس الجلسة.
+    """
+    def __init__(self):
+        self.cutoff_hour = 3.0
+        self.saturate_minutes = None
+        self.tolerance_enabled = False
+        self.tolerance_minutes = 0
+        self.duplicate_punch_tolerance = 10
 
 
 class MainWindow(QMainWindow):
@@ -58,6 +67,7 @@ class MainWindow(QMainWindow):
         self.employee_repo = EmployeeRepository(self.session)
         self.file_settings_repo = FileSettingsRepository(self.session)
         self.rate_repo = EmployeeRateRepository(self.session)
+        self.correction_state_repo = CorrectionStateRepository(self.session)
 
         self._current_company_id = None
         self._current_company_name = None
@@ -65,10 +75,28 @@ class MainWindow(QMainWindow):
         self._current_month = None
         self._current_file_id = None
         self._current_emp_days = None
-        self._eid_to_employee_id = {}   # external_code -> Employee.id (فارغ في وضع Anonymous)
+        self._current_df = None
+        self._eid_to_employee_id = {}
+        self._eid_to_name = {}
+
+        self._current_corrections = {}
+        self._current_day_overrides = {}
+
+        # [Phase 8] لازم نخزّن bytes الملف الحالي وصيغته عشان نقدر نعيد
+        # التحليل من الصفر لما إعداد يتغيّر (Cutoff/Saturate/Tolerance...)
+        # بدون الحاجة لإعادة قراءته من القرص أو من ImportDialog كل مرة.
+        self._current_file_bytes = None
+        self._current_file_format = None
+        self._current_header_text = ""
+        # [Phase 8] الإعدادات الحالية (FileSettings من القاعدة، أو
+        # _DefaultFileSettings في وضع Anonymous) — نحتفظ بها هنا عشان
+        # _on_settings_changed يقدر يحدّثها Runtime في وضع Anonymous
+        # (لأنه مفيش صف FileSettings بالقاعدة يتحدّث بدله).
+        self._current_settings = None
 
         self._build_central_stack()
         self._build_sidebar()
+        self._build_settings_dock()   # [Phase 8]
         self._build_status_bar()
 
         self._show_import_placeholder()
@@ -92,15 +120,28 @@ class MainWindow(QMainWindow):
 
         self.stack.addWidget(self.placeholder_page)
 
-        # ── الشاشة الرئيسية الحقيقية (Dashboard) — Phase 4 ──
+        # ── الشاشة الرئيسية (Dashboard) ──
         self.dashboard_page = DashboardView()
         self.dashboard_page.rate_changed.connect(self._on_rate_changed)
         self.dashboard_page.employee_selected.connect(self._on_employee_selected)
         self.stack.addWidget(self.dashboard_page)
 
+        # ── شاشة تفاصيل الموظف ──
+        self.employee_detail_page = EmployeeDetailView()
+        self.employee_detail_page.back_requested.connect(self._on_employee_detail_back)
+        self.employee_detail_page.changes_saved.connect(self._on_employee_changes_saved)
+        self.employee_detail_page.reset_requested.connect(self._on_employee_reset)
+        self.employee_detail_page.pending_count_changed.connect(self.update_pending_status)
+        self.stack.addWidget(self.employee_detail_page)
+
     def _show_import_placeholder(self):
         self.stack.setCurrentWidget(self.placeholder_page)
         self.setWindowTitle(f"{APP_NAME} — v{APP_VERSION}")
+        # [Phase 8] تعطيل لوحة الإعدادات ومسح حالة الملف الحالي بالكامل
+        self.settings_panel.clear()
+        self._current_file_bytes = None
+        self._current_file_format = None
+        self._current_settings = None
 
     # ══════════════════════════════════════════════════════════════════
     # الشريط الجانبي (Sidebar / Dock Widget)
@@ -118,6 +159,20 @@ class MainWindow(QMainWindow):
         self.sidebar_dock = dock
 
     # ══════════════════════════════════════════════════════════════════
+    # [Phase 8] لوحة الإعدادات (Dock مستقل — شقيق لشجرة الملفات)
+    # ══════════════════════════════════════════════════════════════════
+    def _build_settings_dock(self):
+        self.settings_panel = SettingsPanel()
+        self.settings_panel.settings_changed.connect(self._on_settings_changed)
+
+        dock = QDockWidget("⚙️ إعدادات الشيفتات", self)
+        dock.setWidget(self.settings_panel)
+        dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
+        # الشجرة يمين (RTL) — الإعدادات تُوضع يسار عشان متتزاحمش مع بعض.
+        self.addDockWidget(Qt.LeftDockWidgetArea, dock)
+        self.settings_dock = dock
+
+    # ══════════════════════════════════════════════════════════════════
     # شريط الحالة (StatusBar)
     # ══════════════════════════════════════════════════════════════════
     def _build_status_bar(self):
@@ -127,7 +182,6 @@ class MainWindow(QMainWindow):
         self.status_bar.addPermanentWidget(self.pending_label)
 
     def update_pending_status(self, count: int):
-        """يُستدعى من Phase 5 لتحديث عدد التعديلات المعلَّقة."""
         if count > 0:
             self.pending_label.setText(f"⏳ {count} تعديل معلَّق بانتظار Apply")
         else:
@@ -148,14 +202,22 @@ class MainWindow(QMainWindow):
             self._current_year = None
             self._current_month = None
             self._current_file_id = None
+            self._current_corrections = {}
+            self._current_day_overrides = {}
             self.setWindowTitle(f"{APP_NAME} — مراجعة مؤقتة (Anonymous)")
 
+            # [Phase 8] تخزين bytes/format/header + إعدادات افتراضية قابلة للتعديل Runtime
+            self._current_file_bytes = payload["file_bytes"]
+            self._current_file_format = payload["file_format"]
+            self._current_header_text = "📤 مراجعة مؤقتة (Anonymous)"
+            self._current_settings = _DefaultFileSettings()
+
             self._run_analysis(
-                file_bytes=payload["file_bytes"],
-                file_format=payload["file_format"],
+                file_bytes=self._current_file_bytes,
+                file_format=self._current_file_format,
                 company_id=None,
-                settings=_DefaultFileSettings(),
-                header_text="📤 مراجعة مؤقتة (Anonymous)",
+                settings=self._current_settings,
+                header_text=self._current_header_text,
             )
         else:
             self._current_company_id = payload["company_id"]
@@ -172,14 +234,25 @@ class MainWindow(QMainWindow):
                 f"({payload['month']:02d}/{payload['year']})"
             )
 
-            settings = self.file_settings_repo.get_or_create(self._current_file_id)
+            state = self.correction_state_repo.load(self._current_file_id)
+            self._current_corrections = state['corrections']
+            self._current_day_overrides = state['day_overrides']
+
+            # [Phase 8]
+            self._current_file_bytes = payload["file_bytes"]
+            self._current_file_format = payload["file_format"]
+            self._current_header_text = (
+                f"📂 {payload['company_name']} — "
+                f"{ARABIC_MONTHS[payload['month']]} {payload['year']}"
+            )
+            self._current_settings = self.file_settings_repo.get_or_create(self._current_file_id)
+
             self._run_analysis(
-                file_bytes=payload["file_bytes"],
-                file_format=payload["file_format"],
+                file_bytes=self._current_file_bytes,
+                file_format=self._current_file_format,
                 company_id=self._current_company_id,
-                settings=settings,
-                header_text=f"📂 {payload['company_name']} — "
-                            f"{ARABIC_MONTHS[payload['month']]} {payload['year']}",
+                settings=self._current_settings,
+                header_text=self._current_header_text,
             )
 
     # ══════════════════════════════════════════════════════════════════
@@ -208,15 +281,24 @@ class MainWindow(QMainWindow):
         self._current_month = month
         self._current_file_id = att_file.id
 
+        state = self.correction_state_repo.load(att_file.id)
+        self._current_corrections = state['corrections']
+        self._current_day_overrides = state['day_overrides']
+
         self.setWindowTitle(f"{APP_NAME} — {company_name} ({month:02d}/{year})")
 
-        settings = self.file_settings_repo.get_or_create(att_file.id)
+        # [Phase 8]
+        self._current_file_bytes = file_bytes
+        self._current_file_format = att_file.file_format
+        self._current_header_text = f"📂 {company_name} — {ARABIC_MONTHS[month]} {year}"
+        self._current_settings = self.file_settings_repo.get_or_create(att_file.id)
+
         self._run_analysis(
-            file_bytes=file_bytes,
-            file_format=att_file.file_format,
+            file_bytes=self._current_file_bytes,
+            file_format=self._current_file_format,
             company_id=company_id,
-            settings=settings,
-            header_text=f"📂 {company_name} — {ARABIC_MONTHS[month]} {year}",
+            settings=self._current_settings,
+            header_text=self._current_header_text,
         )
 
     # ══════════════════════════════════════════════════════════════════
@@ -253,16 +335,19 @@ class MainWindow(QMainWindow):
             tolerance_enabled=settings.tolerance_enabled,
             saturate_min=settings.saturate_minutes,
         )
-        overrides_summary = summarize_emp_days(emp_days)
         self._current_emp_days = emp_days
+        self._current_df = df
 
         # ── مزامنة الموظفين مع القاعدة + تحميل أسعار الساعة المحفوظة ──
         hourly_rates = {}
         self._eid_to_employee_id = {}
+        self._eid_to_name = {}
 
-        if company_id is not None:
-            for _, row in df.iterrows():
-                eid = str(row['id'])
+        for _, row in df.iterrows():
+            eid = str(row['id'])
+            self._eid_to_name[eid] = row.get('name', eid)
+
+            if company_id is not None:
                 employee = self.employee_repo.get_or_create(
                     company_id=company_id,
                     external_code=eid,
@@ -271,32 +356,117 @@ class MainWindow(QMainWindow):
                 )
                 self._eid_to_employee_id[eid] = employee.id
 
+        if company_id is not None:
+            self.session.expire_all()
             rates_by_employee_id = self.rate_repo.get_rates_map_by_employee_id(company_id)
             for eid, emp_id in self._eid_to_employee_id.items():
                 if emp_id in rates_by_employee_id:
                     hourly_rates[eid] = rates_by_employee_id[emp_id]
 
+        overrides_summary = apply_overrides(
+            emp_days, self._current_corrections, self._current_day_overrides
+        )
+
         self.dashboard_page.load_data(header_text, df, overrides_summary, hourly_rates)
         self.stack.setCurrentWidget(self.dashboard_page)
+        self.update_pending_status(0)
+
+        # [Phase 8] تحديث لوحة الإعدادات بقيم settings الحالية (بدون إطلاق
+        # settings_changed — load_settings تستخدم _loading flag لمنع ده)
+        self.settings_panel.load_settings(settings)
+
+    # ══════════════════════════════════════════════════════════════════
+    def _recompute_dashboard(self):
+        """إعادة حساب overrides_summary وتحديث لوحة التحكم بعد أي تغيير تصحيحات."""
+        if self._current_df is None or self._current_emp_days is None:
+            return
+        overrides_summary = apply_overrides(
+            self._current_emp_days, self._current_corrections, self._current_day_overrides
+        )
+        hourly_rates = dict(self.dashboard_page._hourly_rates)
+        header_text = self.dashboard_page.header_label.text()
+        self.dashboard_page.load_data(header_text, self._current_df, overrides_summary, hourly_rates)
 
     # ══════════════════════════════════════════════════════════════════
     def _on_rate_changed(self, eid: str, rate: float):
-        """حفظ سعر الساعة كإعداد افتراضي دائم للموظف داخل شركته (لو مش Anonymous)."""
         if self._current_company_id is None:
-            return  # وضع Anonymous — السعر في الذاكرة فقط، بدون حفظ دائم
+            return
         employee_id = self._eid_to_employee_id.get(eid)
         if employee_id is None:
             return
         self.rate_repo.set_rate(self._current_company_id, employee_id, rate)
 
     # ══════════════════════════════════════════════════════════════════
-    def _on_employee_selected(self, eid: str):
-        """Phase 5: فتح EmployeeDetailView الكاملة. حاليًا Placeholder بسيط."""
-        QMessageBox.information(
-            self, "قريبًا",
-            f"شاشة تفاصيل الموظف (ID: {eid}) هتُضاف في Phase 5 "
-            "(التصحيحات اليدوية وReview Panel)."
+    # [Phase 8] تغيير أي إعداد شيفت (Cutoff/Saturate/Tolerance/Duplicate)
+    # ══════════════════════════════════════════════════════════════════
+    def _on_settings_changed(self, new_values: dict):
+        if self._current_file_bytes is None or self._current_file_format is None:
+            return  # لا يوجد ملف مفتوح حاليًا — الحماية أصلًا موجودة عبر setEnabled(False)
+
+        if self._current_file_id is not None:
+            # ملف محفوظ فعليًا (غير Anonymous) → نحفظ في قاعدة البيانات فورًا
+            # (نفس فلسفة auto_save_file_state في oldapp.py — بدون زر حفظ منفصل)
+            self._current_settings = self.file_settings_repo.update(
+                self._current_file_id, **new_values
+            )
+        else:
+            # وضع Anonymous → لا يوجد صف FileSettings بالقاعدة، فنحدّث
+            # الكائن الافتراضي في الذاكرة فقط
+            for key, value in new_values.items():
+                setattr(self._current_settings, key, value)
+
+        # إعادة التحليل الكامل بنفس bytes الملف الحالي مع الإعدادات الجديدة.
+        # ملاحظة: هذا يعيد بناء self._current_emp_days من الصفر، لذلك أي
+        # تصحيحات يدوية/Day Overrides محفوظة (self._current_corrections /
+        # self._current_day_overrides) تُطبَّق تلقائيًا مرة أخرى داخل
+        # apply_overrides() كجزء من _run_analysis — لا فقدان بيانات.
+        self._run_analysis(
+            file_bytes=self._current_file_bytes,
+            file_format=self._current_file_format,
+            company_id=self._current_company_id,
+            settings=self._current_settings,
+            header_text=self._current_header_text,
         )
+
+    # ══════════════════════════════════════════════════════════════════
+    # شاشة تفاصيل الموظف
+    # ══════════════════════════════════════════════════════════════════
+    def _on_employee_selected(self, eid: str):
+        if not self._current_emp_days or eid not in self._current_emp_days:
+            QMessageBox.warning(self, "تنبيه", "لا توجد بيانات لهذا الموظف.")
+            return
+
+        days = self._current_emp_days[eid]
+        name = self._eid_to_name.get(eid, eid)
+        self.employee_detail_page.load_employee(
+            eid, name, days, self._current_corrections, self._current_day_overrides
+        )
+        self.stack.setCurrentWidget(self.employee_detail_page)
+
+    def _on_employee_detail_back(self):
+        self.stack.setCurrentWidget(self.dashboard_page)
+        self.update_pending_status(0)
+
+    def _on_employee_changes_saved(self, eid: str, corrections: dict, day_overrides: dict):
+        """يُستدعى بعد Apply أو Reset داخل EmployeeDetailView."""
+        self._current_corrections = corrections
+        self._current_day_overrides = day_overrides
+
+        if self._current_file_id is not None:
+            self.correction_state_repo.save(
+                self._current_file_id, self._current_corrections, self._current_day_overrides
+            )
+
+        self._recompute_dashboard()
+
+    def _on_employee_reset(self, eid: str):
+        prefix = f"{eid}_"
+        self._current_corrections = {
+            k: v for k, v in self._current_corrections.items() if not k.startswith(prefix)
+        }
+        self._current_day_overrides = {
+            k: v for k, v in self._current_day_overrides.items() if not k.startswith(prefix)
+        }
 
     # ══════════════════════════════════════════════════════════════════
     def _on_company_renamed(self, company_id: int, new_name: str):
@@ -313,7 +483,16 @@ class MainWindow(QMainWindow):
 
     # ══════════════════════════════════════════════════════════════════
     def closeEvent(self, event):
-        # TODO (Phase 5+): فحص وجود تعديلات معلّقة قبل الإغلاق وعرض تأكيد.
+        if (self.stack.currentWidget() is self.employee_detail_page
+                and self.employee_detail_page.has_pending_changes()):
+            confirm = QMessageBox.warning(
+                self, "تعديلات لم تُطبَّق",
+                "⚠️ لديك تعديلات لم تُطبَّق بعد. هل تريد الإغلاق على أي حال؟",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if confirm != QMessageBox.Yes:
+                event.ignore()
+                return
         try:
             self.session.close()
         except Exception:
